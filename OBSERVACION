@@ -1,0 +1,5 @@
+DESCARGUEN ESTO PRIMERO
+sudo apt install libncurses5-dev
+descarguen tambien el make
+sudo apt install make
+para que funcione
