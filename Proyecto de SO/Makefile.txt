@@ -1,0 +1,22 @@
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -g
+LDFLAGS = -lncurses -lpthread
+TARGET = file_manager
+SRCS = codigo.cpp
+OBJS = $(SRCS:.cpp=.o)
+
+$(TARGET): $(OBJS)
+TAB $(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.cpp
+TAB $(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+TAB rm -f $(OBJS) $(TARGET)
+
+run: $(TARGET)
+TAB ./$(TARGET)
+
+.PHONY: clean run
+
+/DONDE DICE TAB DEBEN USAR TABULADOR

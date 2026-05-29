@@ -1,0 +1,261 @@
+#include <ncurses.h>
+#include <cstdlib>
+#include <string>
+#include <ctime>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <unistd.h>
+
+int TERM_ROWS, TERM_COLS;
+
+WINDOW *win_izq   = nullptr;  //Ventana Izquierda
+WINDOW *win_der   = nullptr;  //Ventana Derecha
+WINDOW *win_barra = nullptr;  //Ventana Inferior
+
+#define COLOR_SELECCIONADO  1
+#define COLOR_DIRECTORIO    2
+#define COLOR_EJECUTABLE    3
+#define COLOR_NORMAL        4
+#define COLOR_BARRA         5
+#define COLOR_ESPECIAL      6
+#define COLOR_BORDE         7
+#define COLOR_TITULO        8
+
+//  init_terminal()
+//  Pone ncurses en modo raw, activa colores y guarda las dimensiones del terminal en TERM_ROWS / TERM_COLS.
+
+void init_terminal() {
+    if (initscr() == nullptr) {
+        fprintf(stderr, "Error: terminal no soportado\n");
+        exit(1);
+    }
+    cbreak();              // Teclas sin buffer (sin esperar Enter)
+    noecho();              // No imprimir lo que escribe el usuario
+    keypad(stdscr, TRUE);  // Habilitar flechas y teclas especiales
+    start_color();         // Activar subsistema de colores
+    curs_set(0);           // Ocultar el cursor parpadeante
+    set_escdelay(25);      // Reducir delay de tecla ESC
+
+    // Obtener tamaño real del terminal
+    getmaxyx(stdscr, TERM_ROWS, TERM_COLS);
+
+    // ── Definir pares de color ────────────────────────────────
+    init_pair(COLOR_SELECCIONADO, COLOR_BLACK,  COLOR_CYAN);
+    init_pair(COLOR_DIRECTORIO,   COLOR_CYAN,   COLOR_BLACK);
+    init_pair(COLOR_EJECUTABLE,   COLOR_GREEN,  COLOR_BLACK);
+    init_pair(COLOR_NORMAL,       COLOR_WHITE,  COLOR_BLACK);
+    init_pair(COLOR_BARRA,        COLOR_BLACK,  COLOR_WHITE);
+    init_pair(COLOR_ESPECIAL,     COLOR_YELLOW, COLOR_BLACK);
+    init_pair(COLOR_BORDE,        COLOR_BLUE,   COLOR_BLACK);
+    init_pair(COLOR_TITULO,       COLOR_WHITE,  COLOR_BLUE);
+}
+
+void cleanup_terminal() {
+    if (win_izq)   { delwin(win_izq);   win_izq   = nullptr; }
+    if (win_der)   { delwin(win_der);   win_der   = nullptr; }
+    if (win_barra) { delwin(win_barra); win_barra = nullptr; }
+    endwin();
+}
+
+void crear_paneles() {
+    int filas_content = TERM_ROWS - 3;  // Filas disponibles (sin barra)
+    int cols_izq      = TERM_COLS / 2;
+    int cols_der      = TERM_COLS - cols_izq;
+
+    // newwin(filas, columnas, fila_inicio, col_inicio)
+    win_izq   = newwin(filas_content, cols_izq,      0, 0);
+    win_der   = newwin(filas_content, cols_der,      0, cols_izq);
+    win_barra = newwin(3,             TERM_COLS,     filas_content, 0);
+
+    // Activar teclas especiales en cada ventana
+    keypad(win_izq,   TRUE);
+    keypad(win_der,   TRUE);
+    keypad(win_barra, TRUE);
+}
+
+// ============================================================
+//  dibujar_borde_titulo()
+//  Dibuja el borde de una ventana y un título en la parte
+//  superior, con fondo azul para destacarlo.
+// ============================================================
+void dibujar_borde_titulo(WINDOW *win, const std::string &titulo) {
+    wattron(win,  COLOR_PAIR(COLOR_BORDE));
+    box(win, 0, 0);  // Dibuja el borde con caracteres ACS
+    wattroff(win, COLOR_PAIR(COLOR_BORDE));
+
+    // Título centrado en la primera línea
+    int win_cols = getmaxx(win);
+    int pos_x    = (win_cols - (int)titulo.size() - 2) / 2;
+    if (pos_x < 1) pos_x = 1;
+
+    wattron(win, COLOR_PAIR(COLOR_TITULO) | A_BOLD);
+    mvwprintw(win, 0, pos_x, " %s ", titulo.c_str());
+    wattroff(win, COLOR_PAIR(COLOR_TITULO) | A_BOLD);
+}
+
+// ============================================================
+//  dibujar_panel_izquierdo ()
+//  Muestra el borde, título y un mensaje de placeholder.
+//  listado real de archivos.
+// ============================================================
+void dibujar_panel_izquierdo(const std::string &ruta_actual) {
+    werase(win_izq);
+    dibujar_borde_titulo(win_izq, "Explorador");
+
+    // Mostrar ruta actual debajo del título
+    wattron(win_izq, COLOR_PAIR(COLOR_ESPECIAL));
+    mvwprintw(win_izq, 1, 2, "%.40s", ruta_actual.c_str());
+    wattroff(win_izq, COLOR_PAIR(COLOR_ESPECIAL));
+
+    // Separador bajo la ruta
+    wattron(win_izq, COLOR_PAIR(COLOR_BORDE));
+    int cols = getmaxx(win_izq);
+    for (int i = 1; i < cols - 1; i++)
+        mvwaddch(win_izq, 2, i, ACS_HLINE);
+    wattroff(win_izq, COLOR_PAIR(COLOR_BORDE));
+
+    // Encabezado de columnas
+    wattron(win_izq, A_BOLD | COLOR_PAIR(COLOR_NORMAL));
+    mvwprintw(win_izq, 3, 2, "%-20s %8s  %-10s  %-8s",
+              "Nombre", "Tamaño", "Permisos", "Fecha");
+    wattroff(win_izq, A_BOLD | COLOR_PAIR(COLOR_NORMAL));
+
+    // Placeholder — Fase 3 reemplazará esto con opendir()/readdir()
+    wattron(win_izq, COLOR_PAIR(COLOR_DIRECTORIO));
+    mvwprintw(win_izq, 5, 2, "📁 .. (directorio padre)");
+    wattroff(win_izq, COLOR_PAIR(COLOR_DIRECTORIO));
+
+    mvwprintw(win_izq, 6, 2,  "[ Fase 3: aqui van los archivos ]");
+    mvwprintw(win_izq, 7, 2,  "opendir() + readdir() + stat()");
+
+    wrefresh(win_izq);
+}
+
+// ============================================================
+//  dibujar_panel_derecho()
+//  Panel de vista — en la Fase 5 tendrá 4 modos:
+//  texto, hex, propiedades y árbol.
+// ============================================================
+void dibujar_panel_derecho() {
+    werase(win_der);
+    dibujar_borde_titulo(win_der, "Vista");
+
+    wattron(win_der, COLOR_PAIR(COLOR_NORMAL));
+    mvwprintw(win_der, 3, 2, "Modos disponibles:");
+    wattroff(win_der, COLOR_PAIR(COLOR_NORMAL));
+
+    // Mostrar los 4 modos que se implementarán
+    const char *modos[] = {
+        "[F2] Texto       — contenido ASCII con scroll",
+        "[F3] Hexadecimal — vista tipo xxd",
+        "[F4] Propiedades — permisos, inode, timestamps",
+        "[F5] Arbol       — estructura del directorio"
+    };
+    for (int i = 0; i < 4; i++) {
+        wattron(win_der, COLOR_PAIR(COLOR_ESPECIAL));
+        mvwprintw(win_der, 5 + i * 2, 2, "%s", modos[i]);
+        wattroff(win_der, COLOR_PAIR(COLOR_ESPECIAL));
+    }
+
+    mvwprintw(win_der, 14, 2, "[ Fase 5: implementar cada modo ]");
+
+    wrefresh(win_der);
+}
+
+// ============================================================
+//  dibujar_barra_inferior()
+//  Muestra usuario, ruta, atajos y hora actual.
+//  El reloj lo manejará un hilo dedicado en la Fase 5.
+// ============================================================
+void dibujar_barra_inferior(const std::string &usuario) {
+    werase(win_barra);
+    wbkgd(win_barra, COLOR_PAIR(COLOR_BARRA));
+
+    // Fila 0: usuario y atajos
+    wattron(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
+    mvwprintw(win_barra, 0, 1, " %s ", usuario.c_str());
+    wattroff(win_barra, A_BOLD);
+
+    mvwprintw(win_barra, 0, 12,
+        "F2:Texto  F3:Hex  F4:Props  F5:Arbol  "
+        "c:Copiar  m:Mover  d:Borrar  r:Renombrar  q:Salir");
+    wattroff(win_barra, COLOR_PAIR(COLOR_BARRA));
+
+    // Fila 1: hora actual (en Fase 5 esto lo actualiza un hilo)
+    time_t ahora = time(nullptr);
+    char buf_hora[32];
+    strftime(buf_hora, sizeof(buf_hora), "%Y-%m-%d  %H:%M:%S", localtime(&ahora));
+
+    wattron(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
+    int cols = getmaxx(win_barra);
+    mvwprintw(win_barra, 1, cols - 22, "%s", buf_hora);
+    wattroff(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
+
+    wrefresh(win_barra);
+}
+
+// ============================================================
+//  obtener_usuario()
+//  Obtiene el nombre del usuario autenticado via POSIX.
+// ============================================================
+std::string obtener_usuario() {
+    struct passwd *pw = getpwuid(getuid());
+    return pw ? std::string(pw->pw_name) : "desconocido";
+}
+
+// ============================================================
+//  loop_principal()
+//  Captura teclas y redibuja. Por ahora solo maneja 'q'
+//  para salir — en Fase 4 se agregan todas las navegaciones.
+// ============================================================
+void loop_principal(const std::string &ruta, const std::string &usuario) {
+    int ch = 0;
+    do {
+        // Redibujar todos los paneles
+        dibujar_panel_izquierdo(ruta);
+        dibujar_panel_derecho();
+        dibujar_barra_inferior(usuario);
+
+        // Esperar tecla en el panel izquierdo (el activo)
+        ch = wgetch(win_izq);
+
+        // En Fase 4 aquí van: KEY_UP, KEY_DOWN, KEY_ENTER, etc.
+        switch (ch) {
+            case 'q':
+            case 'Q':
+                // Salir
+                break;
+            // TODO Fase 4: navegación completa
+            default:
+                break;
+        }
+
+    } while (ch != 'q' && ch != 'Q');
+}
+
+// ============================================================
+//  main()
+// ============================================================
+int main(int argc, char *argv[]) {
+    // Directorio inicial: argumento o directorio actual
+    std::string ruta_inicial = (argc > 1) ? argv[1] : ".";
+
+    // Limpiar el terminal al salir aunque haya crash
+    atexit(cleanup_terminal);
+
+    // 1. Inicializar ncurses
+    init_terminal();
+
+    // 3. Crear los tres paneles
+    crear_paneles();
+
+    // 4. Obtener usuario actual (POSIX)
+    std::string usuario = obtener_usuario();
+
+    // 5. Entrar al loop principal
+    loop_principal(ruta_inicial, usuario);
+
+    // 6. cleanup_terminal() se llama automaticamente por atexit()
+    return 0;
+}
