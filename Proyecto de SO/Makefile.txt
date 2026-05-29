@@ -6,17 +6,15 @@ SRCS = codigo.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 $(TARGET): $(OBJS)
-TAB $(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+  $(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o: %.cpp
-TAB $(CXX) $(CXXFLAGS) -c $< -o $@
+  $(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-TAB rm -f $(OBJS) $(TARGET)
+  rm -f $(OBJS) $(TARGET)
 
 run: $(TARGET)
-TAB ./$(TARGET)
+  ./$(TARGET)
 
 .PHONY: clean run
-
-/DONDE DICE TAB DEBEN USAR TABULADOR
