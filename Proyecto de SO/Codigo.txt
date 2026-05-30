@@ -6,12 +6,43 @@
 #include <sys/stat.h>
 #include <pwd.h>
 #include <unistd.h>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <sys/wait.h>
+#include <pthread.h>
+#include <atomic>
+
 
 int TERM_ROWS, TERM_COLS;
 
 WINDOW *win_izq   = nullptr;  //Ventana Izquierda
 WINDOW *win_der   = nullptr;  //Ventana Derecha
 WINDOW *win_barra = nullptr;  //Ventana Inferior
+
+// ── Estructura que representa un archivo o directorio ─────────
+struct Entrada {
+    std::string nombre;       // Nombre del archivo
+    std::string tamanio;      // "1.2 KiB", "3.4 MiB", etc.
+    std::string permisos;     // "-rwxr-xr-x"
+    std::string fecha;        // "2024-05-01"
+    std::string tipo;         // "Dir", "PDF", "Imagen", etc.
+    ino_t       inodo;        // Número de i-nodo
+    bool        es_dir;       // true si es directorio
+    bool        es_ejecutable;
+    off_t       tamanio_raw;  // Tamaño en bytes (para ordenar)
+};
+
+std::vector<Entrada> entradas_actuales;
+int    indice_sel      = 0;   // Entrada seleccionada
+int    scroll_offset   = 0;   // Para scroll si hay muchos archivos
+bool   mostrar_ocultos = false;
+bool   mostrar_inodos  = false;
+std::string ruta_actual = ".";
+
+std::atomic<bool> hilo_activo(true);  // Controla cuándo para el hilo
+pthread_t hilo_reloj;                  // Identificador del hilo
+pthread_mutex_t mutex_pantalla = PTHREAD_MUTEX_INITIALIZER;
 
 #define COLOR_SELECCIONADO  1
 #define COLOR_DIRECTORIO    2
@@ -22,9 +53,123 @@ WINDOW *win_barra = nullptr;  //Ventana Inferior
 #define COLOR_BORDE         7
 #define COLOR_TITULO        8
 
+
+// ── Convierte bytes a notación de ingeniería ──────────────────
+std::string formatear_tamanio(off_t bytes) {
+    if (bytes < 1024)
+        return std::to_string(bytes) + " B";
+    else if (bytes < 1024 * 1024)
+        return std::to_string(bytes / 1024) + " KiB";
+    else if (bytes < 1024 * 1024 * 1024)
+        return std::to_string(bytes / (1024 * 1024)) + " MiB";
+    else
+        return std::to_string(bytes / (1024 * 1024 * 1024)) + " GiB";
+}
+
+// ── Convierte el modo stat a string tipo "-rwxr-xr-x" ─────────
+std::string formatear_permisos(mode_t mode) {
+    std::string p = "----------";
+    if (S_ISDIR(mode))  p[0] = 'd';
+    if (S_ISLNK(mode))  p[0] = 'l';
+    if (mode & S_IRUSR) p[1] = 'r';
+    if (mode & S_IWUSR) p[2] = 'w';
+    if (mode & S_IXUSR) p[3] = 'x';
+    if (mode & S_IRGRP) p[4] = 'r';
+    if (mode & S_IWGRP) p[5] = 'w';
+    if (mode & S_IXGRP) p[6] = 'x';
+    if (mode & S_IROTH) p[7] = 'r';
+    if (mode & S_IWOTH) p[8] = 'w';
+    if (mode & S_IXOTH) p[9] = 'x';
+    return p;
+}
+
+// ── Detecta el tipo de archivo por magic number o extensión ───
+std::string detectar_tipo(const std::string &ruta, mode_t mode) {
+    if (S_ISDIR(mode))  return "Dir";
+    if (S_ISLNK(mode))  return "Enlace";
+
+    // Intentar leer magic number (primeros 4 bytes)
+    FILE *f = fopen(ruta.c_str(), "rb");
+    if (f) {
+        unsigned char magic[4] = {0};
+        fread(magic, 1, 4, f);
+        fclose(f);
+
+        if (magic[0] == 0x25 && magic[1] == 0x50) return "PDF";
+        if (magic[0] == 0x89 && magic[1] == 0x50) return "PNG";
+        if (magic[0] == 0x47 && magic[1] == 0x49) return "GIF";
+        if (magic[0] == 0xFF && magic[1] == 0xD8) return "JPG";
+        if (magic[0] == 0x7F && magic[1] == 0x45) return "ELF";
+        if (magic[0] == 0x23 && magic[1] == 0x21) return "Script";
+    }
+
+    // Fallback por extensión
+    auto pos = ruta.rfind('.');
+    if (pos != std::string::npos) {
+        std::string ext = ruta.substr(pos + 1);
+        if (ext == "cpp" || ext == "c" || ext == "h") return "Codigo";
+        if (ext == "txt" || ext == "md")              return "Texto";
+        if (ext == "zip" || ext == "tar" || ext == "gz") return "Comprimido";
+        if (ext == "mp3" || ext == "wav")             return "Audio";
+    }
+
+    return "Binario";
+}
+// ── Lee el directorio y retorna vector de Entradas ────────────
+std::vector<Entrada> leer_directorio(const std::string &ruta, bool mostrar_ocultos) {
+    std::vector<Entrada> entradas;
+
+    DIR *dir = opendir(ruta.c_str());
+    if (!dir) return entradas;
+
+    struct dirent *dp;
+    while ((dp = readdir(dir)) != nullptr) {
+        std::string nombre = dp->d_name;
+
+        // Saltar "." pero conservar ".."
+        if (nombre == ".") continue;
+
+        // Saltar ocultos si el toggle está desactivado
+        if (!mostrar_ocultos && nombre[0] == '.' && nombre != "..")
+            continue;
+
+        // Obtener info del archivo con stat
+        std::string ruta_completa = ruta + "/" + nombre;
+        struct stat st;
+        if (lstat(ruta_completa.c_str(), &st) != 0) continue;
+
+        Entrada e;
+        e.nombre        = nombre;
+        e.inodo         = dp->d_ino;
+        e.es_dir        = S_ISDIR(st.st_mode);
+        e.es_ejecutable = (st.st_mode & S_IXUSR) && !e.es_dir;
+        e.tamanio_raw   = st.st_size;
+        e.tamanio       = e.es_dir ? "<DIR>" : formatear_tamanio(st.st_size);
+        e.permisos      = formatear_permisos(st.st_mode);
+        e.tipo          = detectar_tipo(ruta_completa, st.st_mode);
+
+        // Fecha de última modificación
+        char buf[16];
+        strftime(buf, sizeof(buf), "%Y-%m-%d", localtime(&st.st_mtime));
+        e.fecha = buf;
+
+        entradas.push_back(e);
+    }
+    closedir(dir);
+
+    // Directorios primero, luego archivos, ambos alfabéticos
+    std::sort(entradas.begin(), entradas.end(), [](const Entrada &a, const Entrada &b) {
+        if (a.nombre == "..") return true;
+        if (b.nombre == "..") return false;
+        if (a.es_dir != b.es_dir) return a.es_dir > b.es_dir;
+        return a.nombre < b.nombre;
+    });
+
+    return entradas;
+}
+
 //  init_terminal()
 //  Pone ncurses en modo raw, activa colores y guarda las dimensiones del terminal en TERM_ROWS / TERM_COLS.
-
 void init_terminal() {
     if (initscr() == nullptr) {
         fprintf(stderr, "Error: terminal no soportado\n");
@@ -73,7 +218,6 @@ void crear_paneles() {
     keypad(win_der,   TRUE);
     keypad(win_barra, TRUE);
 }
-
 // ============================================================
 //  dibujar_borde_titulo()
 //  Dibuja el borde de una ventana y un título en la parte
@@ -93,22 +237,19 @@ void dibujar_borde_titulo(WINDOW *win, const std::string &titulo) {
     mvwprintw(win, 0, pos_x, " %s ", titulo.c_str());
     wattroff(win, COLOR_PAIR(COLOR_TITULO) | A_BOLD);
 }
-
 // ============================================================
-//  dibujar_panel_izquierdo ()
-//  Muestra el borde, título y un mensaje de placeholder.
-//  listado real de archivos.
+//  dibujar_panel_izquierdo() -- EXPLORADOR
 // ============================================================
-void dibujar_panel_izquierdo(const std::string &ruta_actual) {
+void dibujar_panel_izquierdo() {
     werase(win_izq);
     dibujar_borde_titulo(win_izq, "Explorador");
 
-    // Mostrar ruta actual debajo del título
+    // Mostrar ruta actual
     wattron(win_izq, COLOR_PAIR(COLOR_ESPECIAL));
     mvwprintw(win_izq, 1, 2, "%.40s", ruta_actual.c_str());
     wattroff(win_izq, COLOR_PAIR(COLOR_ESPECIAL));
 
-    // Separador bajo la ruta
+    // Separador
     wattron(win_izq, COLOR_PAIR(COLOR_BORDE));
     int cols = getmaxx(win_izq);
     for (int i = 1; i < cols - 1; i++)
@@ -117,17 +258,49 @@ void dibujar_panel_izquierdo(const std::string &ruta_actual) {
 
     // Encabezado de columnas
     wattron(win_izq, A_BOLD | COLOR_PAIR(COLOR_NORMAL));
-    mvwprintw(win_izq, 3, 2, "%-20s %8s  %-10s  %-8s",
-              "Nombre", "Tamaño", "Permisos", "Fecha");
+    if (mostrar_inodos)
+        mvwprintw(win_izq, 3, 2, "%-6s %-18s %7s  %-10s %-10s %-8s",
+                  "Inodo","Nombre","Tamaño","Permisos","Fecha","Tipo");
+    else
+        mvwprintw(win_izq, 3, 2, "%-20s %7s  %-10s %-10s %-8s",
+                  "Nombre","Tamaño","Permisos","Fecha","Tipo");
     wattroff(win_izq, A_BOLD | COLOR_PAIR(COLOR_NORMAL));
 
-    // Placeholder — Fase 3 reemplazará esto con opendir()/readdir()
-    wattron(win_izq, COLOR_PAIR(COLOR_DIRECTORIO));
-    mvwprintw(win_izq, 5, 2, "📁 .. (directorio padre)");
-    wattroff(win_izq, COLOR_PAIR(COLOR_DIRECTORIO));
+   // Listar entradas
+    int filas_disp = getmaxy(win_izq) - 5;
+    for (int i = 0; i < filas_disp && (i + scroll_offset) < (int)entradas_actuales.size(); i++) {
+        int idx = i + scroll_offset;
+        const Entrada &e = entradas_actuales[idx];
+        // Color según tipo
+        if (idx == indice_sel)
+            wattron(win_izq, COLOR_PAIR(COLOR_SELECCIONADO) | A_BOLD);
+        else if (e.es_dir)
+            wattron(win_izq, COLOR_PAIR(COLOR_DIRECTORIO));
+        else if (e.es_ejecutable)
+            wattron(win_izq, COLOR_PAIR(COLOR_EJECUTABLE));
+        else
+            wattron(win_izq, COLOR_PAIR(COLOR_NORMAL));
 
-    mvwprintw(win_izq, 6, 2,  "[ Fase 3: aqui van los archivos ]");
-    mvwprintw(win_izq, 7, 2,  "opendir() + readdir() + stat()");
+        if (mostrar_inodos)
+            mvwprintw(win_izq, 4 + i, 2, "%-6lu %-18s %7s  %-10s %-10s %-8s",
+                      e.inodo,
+                      e.nombre.substr(0,18).c_str(),
+                      e.tamanio.c_str(),
+                      e.permisos.c_str(),
+                      e.fecha.c_str(),
+                      e.tipo.c_str());
+        else
+            mvwprintw(win_izq, 4 + i, 2, "%-20s %7s  %-10s %-10s %-8s",
+                      e.nombre.substr(0,20).c_str(),
+                      e.tamanio.c_str(),
+                      e.permisos.c_str(),
+                      e.fecha.c_str(),
+                      e.tipo.c_str());
+
+        // Apagar atributos
+        wattroff(win_izq, COLOR_PAIR(COLOR_SELECCIONADO) | COLOR_PAIR(COLOR_DIRECTORIO) |
+                          COLOR_PAIR(COLOR_EJECUTABLE)   | COLOR_PAIR(COLOR_NORMAL) | A_BOLD);
+    }
 
     wrefresh(win_izq);
 }
@@ -162,7 +335,6 @@ void dibujar_panel_derecho() {
 
     wrefresh(win_der);
 }
-
 // ============================================================
 //  dibujar_barra_inferior()
 //  Muestra usuario, ruta, atajos y hora actual.
@@ -172,14 +344,14 @@ void dibujar_barra_inferior(const std::string &usuario) {
     werase(win_barra);
     wbkgd(win_barra, COLOR_PAIR(COLOR_BARRA));
 
-    // Fila 0: usuario y atajos
+    // Nombre de usuario y atajos
     wattron(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
     mvwprintw(win_barra, 0, 1, " %s ", usuario.c_str());
     wattroff(win_barra, A_BOLD);
 
-    mvwprintw(win_barra, 0, 12,
+    mvwprintw(win_barra, 0, 12,"I: Inodos H: Ocultos N: Nano "
         "F2:Texto  F3:Hex  F4:Props  F5:Arbol  "
-        "c:Copiar  m:Mover  d:Borrar  r:Renombrar  q:Salir");
+        "C:Copiar  M:Mover  B:Borrar  R:Renombrar  Q:Salir");
     wattroff(win_barra, COLOR_PAIR(COLOR_BARRA));
 
     // Fila 1: hora actual (en Fase 5 esto lo actualiza un hilo)
@@ -196,42 +368,174 @@ void dibujar_barra_inferior(const std::string &usuario) {
 }
 
 // ============================================================
-//  obtener_usuario()
-//  Obtiene el nombre del usuario autenticado via POSIX.
+//  obtener_usuario() -- Obtiene el nombre del usuario.
 // ============================================================
+
 std::string obtener_usuario() {
     struct passwd *pw = getpwuid(getuid());
     return pw ? std::string(pw->pw_name) : "desconocido";
 }
 
+// ── Detecta si un archivo es texto ASCII ─────────────────────
+bool es_texto(const std::string &ruta) {
+    FILE *f = fopen(ruta.c_str(), "rb");
+    if (!f) return false;
+
+    unsigned char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] < 8 || (buf[i] > 13 && buf[i] < 32 && buf[i] != 27))
+            return false;
+    }
+    return true;
+}
+// ── Abre un archivo en nano como proceso hijo ─────────────────
+void abrir_en_nano(const std::string &ruta_archivo) {
+    // Suspender ncurses antes de lanzar nano
+    def_prog_mode();   // Guarda el modo actual del terminal
+    endwin();          // Libera el terminal para que nano lo use
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // ── Proceso hijo — se convierte en nano ───────────────
+        execlp("nano", "nano", ruta_archivo.c_str(), nullptr);
+        perror("execlp nano");
+        exit(1);
+
+    } else if (pid > 0) {
+        // ── Proceso padre — espera a que nano termine ─────────
+        int status;
+        waitpid(pid, &status, 0);
+
+    } else {
+           perror("fork");
+    }
+
+    // Retomar ncurses después de que nano cerró
+    reset_prog_mode();  // Restaura el modo guardado
+    refresh();          // Redibujar la pantalla
+}
+
+void *actualizar_reloj(void *arg) {
+    while (hilo_activo) {
+        pthread_mutex_lock(&mutex_pantalla);
+        if (win_barra) {
+            std::string usuario = obtener_usuario();
+            dibujar_barra_inferior(usuario);
+        }
+         pthread_mutex_unlock(&mutex_pantalla);
+          napms(100);
+    }
+    return nullptr;
+}
 // ============================================================
-//  loop_principal()
-//  Captura teclas y redibuja. Por ahora solo maneja 'q'
-//  para salir — en Fase 4 se agregan todas las navegaciones.
+//  loop_principal() -- Captura teclas
 // ============================================================
-void loop_principal(const std::string &ruta, const std::string &usuario) {
+void loop_principal(const std::string &usuario){
+    //Cargar directorio Inicial
+     entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+
+    //Arrancar el hilo del reloj
+     pthread_create(&hilo_reloj, nullptr, actualizar_reloj, nullptr);
+
     int ch = 0;
     do {
         // Redibujar todos los paneles
-        dibujar_panel_izquierdo(ruta);
+        pthread_mutex_lock(&mutex_pantalla);
+        dibujar_panel_izquierdo();
         dibujar_panel_derecho();
         dibujar_barra_inferior(usuario);
+        pthread_mutex_unlock(&mutex_pantalla);
 
         // Esperar tecla en el panel izquierdo (el activo)
         ch = wgetch(win_izq);
-
-        // En Fase 4 aquí van: KEY_UP, KEY_DOWN, KEY_ENTER, etc.
+       pthread_mutex_lock(&mutex_pantalla);
         switch (ch) {
+
+            case KEY_UP:
+                if (indice_sel > 0) {
+                    indice_sel--;
+                    if (indice_sel < scroll_offset)
+                        scroll_offset--;
+                }
+                break;
+
+            case KEY_DOWN:
+                if (indice_sel < (int)entradas_actuales.size() - 1) {
+                    indice_sel++;
+                    int filas_disp = getmaxy(win_izq) - 5;
+                    if (indice_sel >= scroll_offset + filas_disp)
+                        scroll_offset++;
+                }
+                break;
+
+            case 10:
+            case KEY_ENTER:
+                if (!entradas_actuales.empty()) {
+                    const Entrada &e = entradas_actuales[indice_sel];
+                    if (e.es_dir) {
+                        if (e.nombre == "..") {
+                            // Directorio padre
+                            auto pos = ruta_actual.rfind('/');
+                            if (pos != std::string::npos && pos != 0)
+                                ruta_actual = ruta_actual.substr(0, pos);
+                            else if (pos == 0)
+                                ruta_actual = "/";
+                        } else {
+                            ruta_actual += "/" + e.nombre;
+                        }
+                        entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                        indice_sel   = 0;
+                        scroll_offset = 0;
+                    }
+                }
+                break;
+            case 'n':
+            case 'N':
+                 if(!entradas_actuales.empty()){
+                  const Entrada &e = entradas_actuales[indice_sel];
+                  if(!e.es_dir){
+                  std::string ruta_completa = ruta_actual + "/" + e.nombre;
+                  if(es_texto(ruta_completa)){
+                   abrir_en_nano(ruta_completa);
+                    //Redibujar todo al regresar del nano
+                    clear();
+                    refresh();
+                    crear_paneles();
+                     }else{
+                       //Mostrar mensaje si no es texto
+                       mvwprintw(win_barra, 2, 2, "No es un archivo de texto ASCII");
+                       wrefresh(win_barra);
+                       napms(1500);  // Mostrar 1.5 segundos
+                      }
+                   }
+                 }
+                break;
+            case 'h':
+            case 'H':
+                mostrar_ocultos = !mostrar_ocultos;
+                entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                indice_sel   = 0;
+                scroll_offset = 0;
+                break;
+
+            case 'i':
+            case 'I':
+                mostrar_inodos = !mostrar_inodos;
+                break;
             case 'q':
             case 'Q':
                 // Salir
                 break;
-            // TODO Fase 4: navegación completa
-            default:
-                break;
-        }
 
+        }
+      pthread_mutex_unlock(&mutex_pantalla);
     } while (ch != 'q' && ch != 'Q');
+    hilo_activo = false;
+    pthread_join(hilo_reloj, nullptr);
 }
 
 // ============================================================
@@ -254,8 +558,8 @@ int main(int argc, char *argv[]) {
     std::string usuario = obtener_usuario();
 
     // 5. Entrar al loop principal
-    loop_principal(ruta_inicial, usuario);
-
+      ruta_actual=ruta_inicial;
+      loop_principal(usuario);
     // 6. cleanup_terminal() se llama automaticamente por atexit()
     return 0;
 }
