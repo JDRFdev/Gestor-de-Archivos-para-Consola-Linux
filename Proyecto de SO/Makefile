@@ -17,4 +17,7 @@ clean:
 run: $(TARGET)
 	./$(TARGET)
 
-.PHONY: clean run
+valgrind: $(TARGET)
+        valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
+
+.PHONY: clean run valgrind
