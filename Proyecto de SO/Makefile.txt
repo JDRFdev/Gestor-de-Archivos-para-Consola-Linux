@@ -1,20 +1,25 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -g
-LDFLAGS = -lncurses -lpthread
-TARGET = file_manager
-SRCS = codigo.cpp
+CXX      = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -g
+LDFLAGS  = -lncurses -lpthread
+TARGET   = file_manager
+SRCS     = codigo.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 $(TARGET): $(OBJS)
-  $(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+        $(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+        @echo "Compilado: ./$(TARGET)"
 
 %.o: %.cpp
-  $(CXX) $(CXXFLAGS) -c $< -o $@
+        $(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-  rm -f $(OBJS) $(TARGET)
+        rm -f $(OBJS) $(TARGET)
+        @echo "Limpiado..."
 
 run: $(TARGET)
-  ./$(TARGET)
+        ./$(TARGET)
 
-.PHONY: clean run
+valgrind: $(TARGET)
+        valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
+
+.PHONY: clean run valgrind
