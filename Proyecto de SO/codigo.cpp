@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <pwd.h>
+#include <grp.h>
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
@@ -12,13 +13,18 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <atomic>
-
+#include <sstream>
+#include <iomanip>
 
 int TERM_ROWS, TERM_COLS;
 
 WINDOW *win_izq   = nullptr;  //Ventana Izquierda
 WINDOW *win_der   = nullptr;  //Ventana Derecha
 WINDOW *win_barra = nullptr;  //Ventana Inferior
+
+// ── Enumeración para controlar los modos de la vista derecha ──
+enum ModoVista { VISTA_TEXTO, VISTA_HEX, VISTA_PROPS, VISTA_ARBOL };
+ModoVista vista_actual = VISTA_TEXTO;
 
 // ── Estructura que representa un archivo o directorio ─────────
 struct Entrada {
@@ -34,8 +40,13 @@ struct Entrada {
 };
 
 std::vector<Entrada> entradas_actuales;
-int    indice_sel      = 0;   // Entrada seleccionada
-int    scroll_offset   = 0;   // Para scroll si hay muchos archivos
+int    indice_sel      = 0;   // Entrada seleccionada en el panel izquierdo
+int    scroll_offset   = 0;   // Para scroll si hay muchos archivos (izquierdo)
+
+// ── Variables para el control del panel derecho ───────────────
+std::vector<std::string> contenido_vista_der; // Líneas de texto/hex a mostrar
+int    scroll_der      = 0;   // Desplazamiento vertical en el panel derecho
+
 bool   mostrar_ocultos = false;
 bool   mostrar_inodos  = false;
 std::string ruta_actual = ".";
@@ -306,32 +317,215 @@ void dibujar_panel_izquierdo() {
 }
 
 // ============================================================
-//  dibujar_panel_derecho()
-//  Panel de vista — en la Fase 5 tendrá 4 modos:
-//  texto, hex, propiedades y árbol.
+//  obtener_usuario() -- Obtiene el nombre del usuario.
 // ============================================================
-void dibujar_panel_derecho() {
-    werase(win_der);
-    dibujar_borde_titulo(win_der, "Vista");
+std::string obtener_usuario() {
+    struct passwd *pw = getpwuid(getuid());
+    return pw ? std::string(pw->pw_name) : "desconocido";
+}
 
-    wattron(win_der, COLOR_PAIR(COLOR_NORMAL));
-    mvwprintw(win_der, 3, 2, "Modos disponibles:");
-    wattroff(win_der, COLOR_PAIR(COLOR_NORMAL));
+// ── Detecta si un archivo es texto ASCII ─────────────────────
+bool es_texto(const std::string &ruta) {
+    FILE *f = fopen(ruta.c_str(), "rb");
+    if (!f) return false;
 
-    // Mostrar los 4 modos que se implementarán
-    const char *modos[] = {
-        "[F2] Texto       — contenido ASCII con scroll",
-        "[F3] Hexadecimal — vista tipo xxd",
-        "[F4] Propiedades — permisos, inode, timestamps",
-        "[F5] Arbol       — estructura del directorio"
-    };
-    for (int i = 0; i < 4; i++) {
-        wattron(win_der, COLOR_PAIR(COLOR_ESPECIAL));
-        mvwprintw(win_der, 5 + i * 2, 2, "%s", modos[i]);
-        wattroff(win_der, COLOR_PAIR(COLOR_ESPECIAL));
+    unsigned char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] < 8 || (buf[i] > 13 && buf[i] < 32 && buf[i] != 27))
+            return false;
+    }
+    return true;
+}
+
+// ── Genera la vista de texto ASCII ────────────────────────────
+void cargar_vista_texto(const std::string &ruta) {
+    contenido_vista_der.clear();
+    if (!es_texto(ruta)) {
+        contenido_vista_der.push_back("No existe vista previa (archivo binario o especial)");
+        return;
     }
 
-    mvwprintw(win_der, 14, 2, "[ Fase 5: implementar cada modo ]");
+    FILE *f = fopen(ruta.c_str(), "r");
+    if (!f) return;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f) && contenido_vista_der.size() < 2000) {
+        // Quitar el salto de línea para ncurses
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+        contenido_vista_der.push_back(line);
+    }
+    fclose(f);
+}
+
+// ── Genera la vista hexadecimal (estilo xxd) ──────────────────
+void cargar_vista_hex(const std::string &ruta) {
+    contenido_vista_der.clear();
+    FILE *f = fopen(ruta.c_str(), "rb");
+    if (!f) return;
+
+    unsigned char buffer[16];
+    size_t n;
+    unsigned int offset = 0;
+
+    while ((n = fread(buffer, 1, 16, f)) > 0 && contenido_vista_der.size() < 2000) {
+        std::stringstream ss;
+        // Offset: 00000000
+        ss << std::hex << std::setw(8) << std::setfill('0') << offset << ": ";
+
+        // Hex bytes: 7f 45 4c 46 ...
+        for (size_t i = 0; i < 16; i++) {
+            if (i < n)
+                ss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i] << " ";
+            else
+                ss << "   ";
+            if (i == 7) ss << " "; // Espacio extra en medio
+        }
+
+        // ASCII representation
+        ss << " ";
+        for (size_t i = 0; i < n; i++) {
+            if (buffer[i] >= 32 && buffer[i] <= 126)
+                ss << (char)buffer[i];
+            else
+                ss << ".";
+        }
+        contenido_vista_der.push_back(ss.str());
+        offset += 16;
+    }
+    fclose(f);
+}
+
+// ── Genera la vista de árbol recursivamente ───────────────────
+void generar_arbol(const std::string &ruta, int nivel, std::string prefijo, bool es_ultimo) {
+    if (nivel > 3) return; // Limitar profundidad por rendimiento
+
+    DIR *dir = opendir(ruta.c_str());
+    if (!dir) return;
+
+    struct dirent *dp;
+    std::vector<std::string> sub;
+    while ((dp = readdir(dir)) != nullptr) {
+        std::string n = dp->d_name;
+        if (n == "." || n == "..") continue;
+        if (!mostrar_ocultos && n[0] == '.') continue;
+        sub.push_back(n);
+    }
+    closedir(dir);
+    std::sort(sub.begin(), sub.end());
+
+    for (size_t i = 0; i < sub.size(); i++) {
+        bool ultimo_hijo = (i == sub.size() - 1);
+        std::string conector = ultimo_hijo ? "+-- " : "|-- ";
+        contenido_vista_der.push_back(prefijo + conector + sub[i]);
+
+        std::string nueva_ruta = ruta + "/" + sub[i];
+        struct stat st;
+        if (lstat(nueva_ruta.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            generar_arbol(nueva_ruta, nivel + 1, prefijo + (ultimo_hijo ? "    " : "|   "), ultimo_hijo);
+        }
+    }
+}
+
+// ── Dibuja las propiedades del archivo en win_der ──────────────
+void dibujar_propiedades(const std::string &ruta) {
+    struct stat st;
+    if (lstat(ruta.c_str(), &st) != 0) return;
+
+    struct passwd *pw = getpwuid(st.st_uid);
+    struct group  *gr = getgrgid(st.st_gid);
+
+    int y = 3;
+    wattron(win_der, COLOR_PAIR(COLOR_NORMAL));
+    mvwprintw(win_der, y++, 2, "Propiedades de: %s", ruta.c_str());
+    mvwprintw(win_der, y++, 2, "-----------------------------------");
+    
+    mvwprintw(win_der, y++, 2, "Inodo:        %lu", (unsigned long)st.st_ino);
+    mvwprintw(win_der, y++, 2, "Enlaces:      %lu", (unsigned long)st.st_nlink);
+    mvwprintw(win_der, y++, 2, "Tamaño:       %ld bytes", (long)st.st_size);
+    mvwprintw(win_der, y++, 2, "Permisos (S): %s", formatear_permisos(st.st_mode).c_str());
+    mvwprintw(win_der, y++, 2, "Permisos (O): %04o", st.st_mode & 07777);
+    mvwprintw(win_der, y++, 2, "Usuario:      %s (%u)", pw ? pw->pw_name : "???", st.st_uid);
+    mvwprintw(win_der, y++, 2, "Grupo:        %s (%u)", gr ? gr->gr_name : "???", st.st_gid);
+
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&st.st_atime));
+    mvwprintw(win_der, y++, 2, "Acceso:       %s", buf);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&st.st_mtime));
+    mvwprintw(win_der, y++, 2, "Modificacion: %s", buf);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&st.st_ctime));
+    mvwprintw(win_der, y++, 2, "Cambio:       %s", buf);
+    
+    wattroff(win_der, COLOR_PAIR(COLOR_NORMAL));
+}
+
+// ── Carga el contenido necesario según la vista actual ────────
+void actualizar_contenido_derecho() {
+    if (entradas_actuales.empty()) {
+        contenido_vista_der.clear();
+        return;
+    }
+
+    const Entrada &e = entradas_actuales[indice_sel];
+    std::string ruta_completa = ruta_actual + "/" + e.nombre;
+
+    if (vista_actual == VISTA_TEXTO) {
+        if (e.es_dir) {
+            contenido_vista_der.clear();
+            contenido_vista_der.push_back("No existe vista previa para directorios.");
+        } else {
+            cargar_vista_texto(ruta_completa);
+        }
+    } else if (vista_actual == VISTA_HEX) {
+        if (e.es_dir) {
+            contenido_vista_der.clear();
+        } else {
+            cargar_vista_hex(ruta_completa);
+        }
+    } else if (vista_actual == VISTA_ARBOL) {
+        contenido_vista_der.clear();
+        if (e.es_dir && e.nombre != "..") {
+            contenido_vista_der.push_back(e.nombre);
+            generar_arbol(ruta_completa, 0, "", true);
+        } else {
+            contenido_vista_der.push_back("Seleccione un directorio para ver el árbol.");
+        }
+    }
+    // VISTA_PROPS se dibuja directamente con stat
+}
+
+void dibujar_panel_derecho() {
+    werase(win_der);
+    
+    std::string titulo = "Vista";
+    if (vista_actual == VISTA_TEXTO) titulo = "Vista de Texto";
+    else if (vista_actual == VISTA_HEX)   titulo = "Vista Hexadecimal";
+    else if (vista_actual == VISTA_PROPS) titulo = "Propiedades";
+    else if (vista_actual == VISTA_ARBOL) titulo = "Vista de Árbol";
+    
+    dibujar_borde_titulo(win_der, titulo);
+
+    if (entradas_actuales.empty()) {
+        wrefresh(win_der);
+        return;
+    }
+
+    if (vista_actual == VISTA_PROPS) {
+        const Entrada &e = entradas_actuales[indice_sel];
+        dibujar_propiedades(ruta_actual + "/" + e.nombre);
+    } else {
+        int filas_disp = getmaxy(win_der) - 2;
+        int cols_disp  = getmaxx(win_der) - 4;
+
+        for (int i = 0; i < filas_disp && (i + scroll_der) < (int)contenido_vista_der.size(); i++) {
+            std::string linea = contenido_vista_der[i + scroll_der];
+            if ((int)linea.size() > cols_disp) linea = linea.substr(0, cols_disp);
+            mvwprintw(win_der, 1 + i, 2, "%s", linea.c_str());
+        }
+    }
 
     wrefresh(win_der);
 }
@@ -367,30 +561,6 @@ void dibujar_barra_inferior(const std::string &usuario) {
     wrefresh(win_barra);
 }
 
-// ============================================================
-//  obtener_usuario() -- Obtiene el nombre del usuario.
-// ============================================================
-
-std::string obtener_usuario() {
-    struct passwd *pw = getpwuid(getuid());
-    return pw ? std::string(pw->pw_name) : "desconocido";
-}
-
-// ── Detecta si un archivo es texto ASCII ─────────────────────
-bool es_texto(const std::string &ruta) {
-    FILE *f = fopen(ruta.c_str(), "rb");
-    if (!f) return false;
-
-    unsigned char buf[512];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    fclose(f);
-
-    for (size_t i = 0; i < n; i++) {
-        if (buf[i] < 8 || (buf[i] > 13 && buf[i] < 32 && buf[i] != 27))
-            return false;
-    }
-    return true;
-}
 // ── Abre un archivo en nano como proceso hijo ─────────────────
 void abrir_en_nano(const std::string &ruta_archivo) {
     // Suspender ncurses antes de lanzar nano
@@ -437,6 +607,7 @@ void *actualizar_reloj(void *arg) {
 void loop_principal(const std::string &usuario){
     //Cargar directorio Inicial
      entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+     actualizar_contenido_derecho();
 
     //Arrancar el hilo del reloj
      pthread_create(&hilo_reloj, nullptr, actualizar_reloj, nullptr);
@@ -452,6 +623,21 @@ void loop_principal(const std::string &usuario){
 
         // Esperar tecla en el panel izquierdo (el activo)
         ch = wgetch(win_izq);
+
+        // Detectar redimensionamiento de pantalla
+        if (ch == KEY_RESIZE) {
+            pthread_mutex_lock(&mutex_pantalla);
+            cleanup_terminal();
+            initscr(); // Re-inicializar stdscr
+            getmaxyx(stdscr, TERM_ROWS, TERM_COLS);
+            crear_paneles();
+            // Recargar contenido para ajustar scrolls
+            entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+            actualizar_contenido_derecho();
+            pthread_mutex_unlock(&mutex_pantalla);
+            continue;
+        }
+
        pthread_mutex_lock(&mutex_pantalla);
         switch (ch) {
 
@@ -460,6 +646,8 @@ void loop_principal(const std::string &usuario){
                     indice_sel--;
                     if (indice_sel < scroll_offset)
                         scroll_offset--;
+                    scroll_der = 0;
+                    actualizar_contenido_derecho();
                 }
                 break;
 
@@ -469,7 +657,46 @@ void loop_principal(const std::string &usuario){
                     int filas_disp = getmaxy(win_izq) - 5;
                     if (indice_sel >= scroll_offset + filas_disp)
                         scroll_offset++;
+                    scroll_der = 0;
+                    actualizar_contenido_derecho();
                 }
+                break;
+
+            case KEY_PPAGE: // Page Up para el panel derecho
+                if (scroll_der > 0) {
+                    scroll_der -= 5;
+                    if (scroll_der < 0) scroll_der = 0;
+                }
+                break;
+
+            case KEY_NPAGE: // Page Down para el panel derecho
+                if (scroll_der + (getmaxy(win_der) - 2) < (int)contenido_vista_der.size()) {
+                    scroll_der += 5;
+                }
+                break;
+
+            case KEY_F(2):
+                vista_actual = VISTA_TEXTO;
+                scroll_der = 0;
+                actualizar_contenido_derecho();
+                break;
+
+            case KEY_F(3):
+                vista_actual = VISTA_HEX;
+                scroll_der = 0;
+                actualizar_contenido_derecho();
+                break;
+
+            case KEY_F(4):
+                vista_actual = VISTA_PROPS;
+                scroll_der = 0;
+                // No necesita actualizar_contenido_derecho ya que lee stat al dibujar
+                break;
+
+            case KEY_F(5):
+                vista_actual = VISTA_ARBOL;
+                scroll_der = 0;
+                actualizar_contenido_derecho();
                 break;
 
             case 10:
@@ -485,34 +712,16 @@ void loop_principal(const std::string &usuario){
                             else if (pos == 0)
                                 ruta_actual = "/";
                         } else {
-                            ruta_actual += "/" + e.nombre;
+                            if (ruta_actual == "/") ruta_actual = "/" + e.nombre;
+                            else ruta_actual += "/" + e.nombre;
                         }
                         entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
                         indice_sel   = 0;
                         scroll_offset = 0;
+                        scroll_der = 0;
+                        actualizar_contenido_derecho();
                     }
                 }
-                break;
-            case 'n':
-            case 'N':
-                 if(!entradas_actuales.empty()){
-                  const Entrada &e = entradas_actuales[indice_sel];
-                  if(!e.es_dir){
-                  std::string ruta_completa = ruta_actual + "/" + e.nombre;
-                  if(es_texto(ruta_completa)){
-                   abrir_en_nano(ruta_completa);
-                    //Redibujar todo al regresar del nano
-                    clear();
-                    refresh();
-                    crear_paneles();
-                     }else{
-                       //Mostrar mensaje si no es texto
-                       mvwprintw(win_barra, 2, 2, "No es un archivo de texto ASCII");
-                       wrefresh(win_barra);
-                       napms(1500);  // Mostrar 1.5 segundos
-                      }
-                   }
-                 }
                 break;
             case 'h':
             case 'H':
@@ -520,6 +729,8 @@ void loop_principal(const std::string &usuario){
                 entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
                 indice_sel   = 0;
                 scroll_offset = 0;
+                scroll_der = 0;
+                actualizar_contenido_derecho();
                 break;
 
             case 'i':

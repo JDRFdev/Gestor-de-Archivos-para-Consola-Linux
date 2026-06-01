@@ -1,0 +1,22 @@
+Hola! Este es un archivo de texto de prueba para el panel derecho.
+Esta es la segunda linea para probar el scroll.
+Linea de prueba 1
+Linea de prueba 2
+Linea de prueba 3
+Linea de prueba 4
+Linea de prueba 5
+Linea de prueba 6
+Linea de prueba 7
+Linea de prueba 8
+Linea de prueba 9
+Linea de prueba 10
+Linea de prueba 11
+Linea de prueba 12
+Linea de prueba 13
+Linea de prueba 14
+Linea de prueba 15
+Linea de prueba 16
+Linea de prueba 17
+Linea de prueba 18
+Linea de prueba 19
+Linea de prueba 20

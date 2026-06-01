@@ -4,3 +4,6 @@ descarguen tambien el make
 sudo apt install make
 para que funcione
 Despues usar make run y ya
+
+NOTA:
+- Si se usa "make clear"  usar: "killall -9 file_manager gestor_so 2>/dev/null"
