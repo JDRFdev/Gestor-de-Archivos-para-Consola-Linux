@@ -1,0 +1,13 @@
+*.o
+
+gestor_so
+
+!test_folder/calculadora
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+.DS_Store
+Thumbs.db

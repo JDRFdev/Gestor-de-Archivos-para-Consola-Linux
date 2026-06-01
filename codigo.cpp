@@ -16,6 +16,8 @@
 #include <sstream>
 #include <iomanip>
 
+using namespace std;
+
 int TERM_ROWS, TERM_COLS;
 
 WINDOW *win_izq   = nullptr;  //Ventana Izquierda
@@ -28,139 +30,230 @@ ModoVista vista_actual = VISTA_TEXTO;
 
 // ── Estructura que representa un archivo o directorio ─────────
 struct Entrada {
-    std::string nombre;       // Nombre del archivo
-    std::string tamanio;      // "1.2 KiB", "3.4 MiB", etc.
-    std::string permisos;     // "-rwxr-xr-x"
-    std::string fecha;        // "2024-05-01"
-    std::string tipo;         // "Dir", "PDF", "Imagen", etc.
+    string nombre;       // Nombre del archivo
+    string tamanio;      // "1.2 KiB", "3.4 MiB", etc.
+    string permisos;     // "-rwxr-xr-x"
+    string fecha;        // "2024-05-01"
+    string tipo;         // "Dir", "PDF", "Imagen", etc.
     ino_t       inodo;        // Número de i-nodo
     bool        es_dir;       // true si es directorio
     bool        es_ejecutable;
     off_t       tamanio_raw;  // Tamaño en bytes (para ordenar)
 };
 
-std::vector<Entrada> entradas_actuales;
+vector<Entrada> entradas_actuales;
 int    indice_sel      = 0;   // Entrada seleccionada en el panel izquierdo
 int    scroll_offset   = 0;   // Para scroll si hay muchos archivos (izquierdo)
 
 // ── Variables para el control del panel derecho ───────────────
-std::vector<std::string> contenido_vista_der; // Líneas de texto/hex a mostrar
+vector<string> contenido_vista_der; // Líneas de texto/hex a mostrar
 int    scroll_der      = 0;   // Desplazamiento vertical en el panel derecho
 
 bool   mostrar_ocultos = false;
 bool   mostrar_inodos  = false;
-std::string ruta_actual = ".";
+string ruta_actual = ".";
 
-std::atomic<bool> hilo_activo(true);  // Controla cuándo para el hilo
-pthread_t hilo_reloj;                  // Identificador del hilo
+atomic<bool> hilo_activo(true);
+atomic<bool> necesita_refresco(true);
+pthread_t hilo_reloj, hilo_refresco;
 pthread_mutex_t mutex_pantalla = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cond_refresco  = PTHREAD_COND_INITIALIZER;
 
-#define COLOR_SELECCIONADO  1
-#define COLOR_DIRECTORIO    2
-#define COLOR_EJECUTABLE    3
-#define COLOR_NORMAL        4
-#define COLOR_BARRA         5
-#define COLOR_ESPECIAL      6
-#define COLOR_BORDE         7
-#define COLOR_TITULO        8
+// ── Enumeración para el orden de la lista ─────────────────────
+enum ModoOrden { ORD_NOMBRE, ORD_TAMANIO, ORD_FECHA, ORD_TIPO };
+ModoOrden orden_actual = ORD_NOMBRE;
+bool      orden_asc    = true;
 
+// ── Definición de IDs de color ───────────────────────────────
+#define COLOR_SELECCIONADO 1
+#define COLOR_DIRECTORIO   2
+#define COLOR_EJECUTABLE   3
+#define COLOR_NORMAL       4
+#define COLOR_BARRA        5
+#define COLOR_ESPECIAL     6
+#define COLOR_BORDE        7
+#define COLOR_TITULO       8
 
-// ── Convierte bytes a notación de ingeniería ──────────────────
-std::string formatear_tamanio(off_t bytes) {
-    if (bytes < 1024)
-        return std::to_string(bytes) + " B";
-    else if (bytes < 1024 * 1024)
-        return std::to_string(bytes / 1024) + " KiB";
-    else if (bytes < 1024 * 1024 * 1024)
-        return std::to_string(bytes / (1024 * 1024)) + " MiB";
-    else
-        return std::to_string(bytes / (1024 * 1024 * 1024)) + " GiB";
+// ── Prototipos de funciones ──────────────────────────────────
+void dibujar_panel_izquierdo();
+void dibujar_panel_derecho();
+void dibujar_barra_inferior(const string &usuario);
+string pedir_entrada(const string &prompt);
+void ejecutar_comando(const vector<string> &args);
+
+// ── Funciones Auxiliares ─────────────────────────────────────
+
+string formatear_tamanio(off_t bytes) {
+    const char *unidades[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    int i = 0;
+    double d = bytes;
+    while (d >= 1024 && i < 4) {
+        d /= 1024;
+        i++;
+    }
+    char buf[32];
+    sprintf(buf, "%.1f %s", d, unidades[i]);
+    return string(buf);
 }
 
-// ── Convierte el modo stat a string tipo "-rwxr-xr-x" ─────────
-std::string formatear_permisos(mode_t mode) {
-    std::string p = "----------";
-    if (S_ISDIR(mode))  p[0] = 'd';
-    if (S_ISLNK(mode))  p[0] = 'l';
-    if (mode & S_IRUSR) p[1] = 'r';
-    if (mode & S_IWUSR) p[2] = 'w';
-    if (mode & S_IXUSR) p[3] = 'x';
-    if (mode & S_IRGRP) p[4] = 'r';
-    if (mode & S_IWGRP) p[5] = 'w';
-    if (mode & S_IXGRP) p[6] = 'x';
-    if (mode & S_IROTH) p[7] = 'r';
-    if (mode & S_IWOTH) p[8] = 'w';
-    if (mode & S_IXOTH) p[9] = 'x';
-    return p;
+string formatear_permisos(mode_t mode) {
+    char buf[11];
+    buf[0] = S_ISDIR(mode) ? 'd' : (S_ISLNK(mode) ? 'l' : '-');
+    buf[1] = (mode & S_IRUSR) ? 'r' : '-';
+    buf[2] = (mode & S_IWUSR) ? 'w' : '-';
+    buf[3] = (mode & S_IXUSR) ? 'x' : '-';
+    buf[4] = (mode & S_IRGRP) ? 'r' : '-';
+    buf[5] = (mode & S_IWGRP) ? 'w' : '-';
+    buf[6] = (mode & S_IXGRP) ? 'x' : '-';
+    buf[7] = (mode & S_IROTH) ? 'r' : '-';
+    buf[8] = (mode & S_IWOTH) ? 'w' : '-';
+    buf[9] = (mode & S_IXOTH) ? 'x' : '-';
+    buf[10] = '\0';
+    return string(buf);
 }
 
-// ── Detecta el tipo de archivo por magic number o extensión ───
-std::string detectar_tipo(const std::string &ruta, mode_t mode) {
-    if (S_ISDIR(mode))  return "Dir";
-    if (S_ISLNK(mode))  return "Enlace";
+string detectar_tipo(const string &ruta, mode_t mode) {
+    if (S_ISDIR(mode)) return "Dir";
+    if (S_ISLNK(mode)) return "Link";
+    
+    size_t dot = ruta.find_last_of('.');
+    if (dot != string::npos) {
+        string ext = ruta.substr(dot + 1);
+        for (auto &c : ext) c = tolower(c);
+        if (ext == "pdf") return "PDF";
+        if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif") return "Img";
+        if (ext == "zip" || ext == "tar" || ext == "gz" || ext == "rar") return "Zip";
+        if (ext == "cpp" || ext == "c" || ext == "h" || ext == "hpp") return "Src";
+        if (ext == "txt" || ext == "md" || ext == "json") return "Txt";
+    }
+    
+    if (mode & S_IXUSR) return "Exe";
+    return "File";
+}
 
-    // Intentar leer magic number (primeros 4 bytes)
-    FILE *f = fopen(ruta.c_str(), "rb");
-    if (f) {
-        unsigned char magic[4] = {0};
-        fread(magic, 1, 4, f);
-        fclose(f);
+string pedir_entrada(const string &prompt) {
+    // Nota: El mutex ya debe estar bloqueado por el llamador (loop_principal)
+    echo();
+    curs_set(1);
+    werase(win_barra);
+    wbkgd(win_barra, COLOR_PAIR(COLOR_BARRA));
+    mvwprintw(win_barra, 1, 2, "%s: ", prompt.c_str());
+    wrefresh(win_barra);
+    
+    char input[256];
+    input[0] = '\0';
+    wgetnstr(win_barra, input, 255);
+    
+    noecho();
+    curs_set(0);
+    return string(input);
+}
 
-        if (magic[0] == 0x25 && magic[1] == 0x50) return "PDF";
-        if (magic[0] == 0x89 && magic[1] == 0x50) return "PNG";
-        if (magic[0] == 0x47 && magic[1] == 0x49) return "GIF";
-        if (magic[0] == 0xFF && magic[1] == 0xD8) return "JPG";
-        if (magic[0] == 0x7F && magic[1] == 0x45) return "ELF";
-        if (magic[0] == 0x23 && magic[1] == 0x21) return "Script";
+// ── Une una ruta y un nombre de archivo de forma segura ──────
+string unir_ruta(const string &dir, const string &nombre) {
+    if (dir == "/") return "/" + nombre;
+    if (dir == ".") return nombre;
+    return dir + "/" + nombre;
+}
+
+// ── ESTRUCTURA PARA MENSAJES IPC ───────────────────────────
+struct MensajeIPC {
+    int codigo_error;
+    char descripcion[256];
+};
+
+// ── EJECUTAR COMANDO CON IPC (PIPES) ─────────────────────────
+// Cumple Requerimiento 1 (Procesos) e IPC (Requerimiento 3)
+void ejecutar_comando(const vector<string> &args) {
+    if (args.empty()) return;
+    
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
+        perror("pipe");
+        return;
     }
 
-    // Fallback por extensión
-    auto pos = ruta.rfind('.');
-    if (pos != std::string::npos) {
-        std::string ext = ruta.substr(pos + 1);
-        if (ext == "cpp" || ext == "c" || ext == "h") return "Codigo";
-        if (ext == "txt" || ext == "md")              return "Texto";
-        if (ext == "zip" || ext == "tar" || ext == "gz") return "Comprimido";
-        if (ext == "mp3" || ext == "wav")             return "Audio";
-    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        // --- PROCESO HIJO ---
+        close(pipe_fd[0]); // Cerrar lectura en el hijo
 
-    return "Binario";
+        // Redirigir stderr al pipe para capturar errores (IPC)
+        dup2(pipe_fd[1], STDERR_FILENO);
+
+        vector<char*> c_args;
+        for (const auto &arg : args) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        c_args.push_back(nullptr);
+        
+        execvp(c_args[0], c_args.data());
+        
+        // Si execvp falla, enviamos el error por el pipe antes de salir
+        perror("execvp");
+        exit(1);
+    } else if (pid > 0) {
+        // --- PROCESO PADRE ---
+        close(pipe_fd[1]); // Cerrar escritura en el padre
+
+        char buffer[512];
+        string error_msg = "";
+        ssize_t n;
+        while ((n = read(pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[n] = '\0';
+            error_msg += buffer;
+        }
+        close(pipe_fd[0]);
+
+        int status;
+        waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            pthread_mutex_lock(&mutex_pantalla);
+            def_prog_mode();
+            endwin();
+            printf("\n--- ERROR EN OPERACION ---\n");
+            printf("Codigo de salida: %d\n", WEXITSTATUS(status));
+            if (!error_msg.empty()) printf("Detalle: %s\n", error_msg.c_str());
+            printf("\nPresione ENTER para volver...");
+            getchar();
+            reset_prog_mode();
+            refresh();
+            pthread_mutex_unlock(&mutex_pantalla);
+        }
+    } else {
+        perror("fork");
+    }
 }
+
 // ── Lee el directorio y retorna vector de Entradas ────────────
-std::vector<Entrada> leer_directorio(const std::string &ruta, bool mostrar_ocultos) {
-    std::vector<Entrada> entradas;
+vector<Entrada> leer_directorio(const string &ruta, bool mostrar_ocultos) {
+    vector<Entrada> entradas;
 
     DIR *dir = opendir(ruta.c_str());
     if (!dir) return entradas;
 
     struct dirent *dp;
     while ((dp = readdir(dir)) != nullptr) {
-        std::string nombre = dp->d_name;
-
-        // Saltar "." pero conservar ".."
+        string nombre = dp->d_name;
         if (nombre == ".") continue;
+        if (!mostrar_ocultos && nombre[0] == '.' && nombre != "..") continue;
 
-        // Saltar ocultos si el toggle está desactivado
-        if (!mostrar_ocultos && nombre[0] == '.' && nombre != "..")
-            continue;
-
-        // Obtener info del archivo con stat
-        std::string ruta_completa = ruta + "/" + nombre;
+        string ruta_completa = (ruta == "/" ? "/" : ruta + "/") + nombre;
         struct stat st;
         if (lstat(ruta_completa.c_str(), &st) != 0) continue;
 
         Entrada e;
         e.nombre        = nombre;
-        e.inodo         = dp->d_ino;
+        e.inodo         = st.st_ino;
         e.es_dir        = S_ISDIR(st.st_mode);
         e.es_ejecutable = (st.st_mode & S_IXUSR) && !e.es_dir;
         e.tamanio_raw   = st.st_size;
         e.tamanio       = e.es_dir ? "<DIR>" : formatear_tamanio(st.st_size);
         e.permisos      = formatear_permisos(st.st_mode);
         e.tipo          = detectar_tipo(ruta_completa, st.st_mode);
-
-        // Fecha de última modificación
-        char buf[16];
+        
+        char buf[20];
         strftime(buf, sizeof(buf), "%Y-%m-%d", localtime(&st.st_mtime));
         e.fecha = buf;
 
@@ -168,15 +261,45 @@ std::vector<Entrada> leer_directorio(const std::string &ruta, bool mostrar_ocult
     }
     closedir(dir);
 
-    // Directorios primero, luego archivos, ambos alfabéticos
-    std::sort(entradas.begin(), entradas.end(), [](const Entrada &a, const Entrada &b) {
+    // ── Ordenamiento Dinámico ────────────────────────────────
+    sort(entradas.begin(), entradas.end(), [](const Entrada &a, const Entrada &b) {
         if (a.nombre == "..") return true;
         if (b.nombre == "..") return false;
         if (a.es_dir != b.es_dir) return a.es_dir > b.es_dir;
-        return a.nombre < b.nombre;
+
+        bool res = false;
+        if (orden_actual == ORD_NOMBRE) res = a.nombre < b.nombre;
+        else if (orden_actual == ORD_TAMANIO) res = a.tamanio_raw < b.tamanio_raw;
+        else if (orden_actual == ORD_FECHA)   res = a.fecha < b.fecha;
+        else if (orden_actual == ORD_TIPO)    res = a.tipo < b.tipo;
+        
+        return orden_asc ? res : !res;
     });
 
     return entradas;
+}
+
+// ── Hilo de refresco: Dibuja cuando hay cambios ───────────────
+void *hilo_refresco_func(void *arg) {
+    const string *user = (const string*)arg;
+    while (hilo_activo) {
+        pthread_mutex_lock(&mutex_pantalla);
+        while (!necesita_refresco && hilo_activo) {
+            pthread_cond_wait(&cond_refresco, &mutex_pantalla);
+        }
+        if (!hilo_activo) {
+            pthread_mutex_unlock(&mutex_pantalla);
+            break;
+        }
+        
+        dibujar_panel_izquierdo();
+        dibujar_panel_derecho();
+        dibujar_barra_inferior(*user);
+        necesita_refresco = false;
+        
+        pthread_mutex_unlock(&mutex_pantalla);
+    }
+    return nullptr;
 }
 
 //  init_terminal()
@@ -234,7 +357,7 @@ void crear_paneles() {
 //  Dibuja el borde de una ventana y un título en la parte
 //  superior, con fondo azul para destacarlo.
 // ============================================================
-void dibujar_borde_titulo(WINDOW *win, const std::string &titulo) {
+void dibujar_borde_titulo(WINDOW *win, const string &titulo) {
     wattron(win,  COLOR_PAIR(COLOR_BORDE));
     box(win, 0, 0);  // Dibuja el borde con caracteres ACS
     wattroff(win, COLOR_PAIR(COLOR_BORDE));
@@ -319,13 +442,13 @@ void dibujar_panel_izquierdo() {
 // ============================================================
 //  obtener_usuario() -- Obtiene el nombre del usuario.
 // ============================================================
-std::string obtener_usuario() {
+string obtener_usuario() {
     struct passwd *pw = getpwuid(getuid());
-    return pw ? std::string(pw->pw_name) : "desconocido";
+    return pw ? string(pw->pw_name) : "desconocido";
 }
 
 // ── Detecta si un archivo es texto ASCII ─────────────────────
-bool es_texto(const std::string &ruta) {
+bool es_texto(const string &ruta) {
     FILE *f = fopen(ruta.c_str(), "rb");
     if (!f) return false;
 
@@ -340,8 +463,7 @@ bool es_texto(const std::string &ruta) {
     return true;
 }
 
-// ── Genera la vista de texto ASCII ────────────────────────────
-void cargar_vista_texto(const std::string &ruta) {
+void cargar_vista_texto(const string &ruta) {
     contenido_vista_der.clear();
     if (!es_texto(ruta)) {
         contenido_vista_der.push_back("No existe vista previa (archivo binario o especial)");
@@ -362,7 +484,7 @@ void cargar_vista_texto(const std::string &ruta) {
 }
 
 // ── Genera la vista hexadecimal (estilo xxd) ──────────────────
-void cargar_vista_hex(const std::string &ruta) {
+void cargar_vista_hex(const string &ruta) {
     contenido_vista_der.clear();
     FILE *f = fopen(ruta.c_str(), "rb");
     if (!f) return;
@@ -372,14 +494,14 @@ void cargar_vista_hex(const std::string &ruta) {
     unsigned int offset = 0;
 
     while ((n = fread(buffer, 1, 16, f)) > 0 && contenido_vista_der.size() < 2000) {
-        std::stringstream ss;
+        stringstream ss;
         // Offset: 00000000
-        ss << std::hex << std::setw(8) << std::setfill('0') << offset << ": ";
+        ss << hex << setw(8) << setfill('0') << offset << ": ";
 
         // Hex bytes: 7f 45 4c 46 ...
         for (size_t i = 0; i < 16; i++) {
             if (i < n)
-                ss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i] << " ";
+                ss << hex << setw(2) << setfill('0') << (int)buffer[i] << " ";
             else
                 ss << "   ";
             if (i == 7) ss << " "; // Espacio extra en medio
@@ -400,29 +522,29 @@ void cargar_vista_hex(const std::string &ruta) {
 }
 
 // ── Genera la vista de árbol recursivamente ───────────────────
-void generar_arbol(const std::string &ruta, int nivel, std::string prefijo, bool es_ultimo) {
+void generar_arbol(const string &ruta, int nivel, string prefijo, bool es_ultimo) {
     if (nivel > 3) return; // Limitar profundidad por rendimiento
 
     DIR *dir = opendir(ruta.c_str());
     if (!dir) return;
 
     struct dirent *dp;
-    std::vector<std::string> sub;
+    vector<string> sub;
     while ((dp = readdir(dir)) != nullptr) {
-        std::string n = dp->d_name;
+        string n = dp->d_name;
         if (n == "." || n == "..") continue;
         if (!mostrar_ocultos && n[0] == '.') continue;
         sub.push_back(n);
     }
     closedir(dir);
-    std::sort(sub.begin(), sub.end());
+    sort(sub.begin(), sub.end());
 
     for (size_t i = 0; i < sub.size(); i++) {
         bool ultimo_hijo = (i == sub.size() - 1);
-        std::string conector = ultimo_hijo ? "+-- " : "|-- ";
+        string conector = ultimo_hijo ? "+-- " : "|-- ";
         contenido_vista_der.push_back(prefijo + conector + sub[i]);
 
-        std::string nueva_ruta = ruta + "/" + sub[i];
+        string nueva_ruta = ruta + "/" + sub[i];
         struct stat st;
         if (lstat(nueva_ruta.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
             generar_arbol(nueva_ruta, nivel + 1, prefijo + (ultimo_hijo ? "    " : "|   "), ultimo_hijo);
@@ -431,7 +553,7 @@ void generar_arbol(const std::string &ruta, int nivel, std::string prefijo, bool
 }
 
 // ── Dibuja las propiedades del archivo en win_der ──────────────
-void dibujar_propiedades(const std::string &ruta) {
+void dibujar_propiedades(const string &ruta) {
     struct stat st;
     if (lstat(ruta.c_str(), &st) != 0) return;
 
@@ -470,7 +592,7 @@ void actualizar_contenido_derecho() {
     }
 
     const Entrada &e = entradas_actuales[indice_sel];
-    std::string ruta_completa = ruta_actual + "/" + e.nombre;
+    string ruta_completa = ruta_actual + "/" + e.nombre;
 
     if (vista_actual == VISTA_TEXTO) {
         if (e.es_dir) {
@@ -500,7 +622,7 @@ void actualizar_contenido_derecho() {
 void dibujar_panel_derecho() {
     werase(win_der);
     
-    std::string titulo = "Vista";
+    string titulo = "Vista";
     if (vista_actual == VISTA_TEXTO) titulo = "Vista de Texto";
     else if (vista_actual == VISTA_HEX)   titulo = "Vista Hexadecimal";
     else if (vista_actual == VISTA_PROPS) titulo = "Propiedades";
@@ -521,7 +643,7 @@ void dibujar_panel_derecho() {
         int cols_disp  = getmaxx(win_der) - 4;
 
         for (int i = 0; i < filas_disp && (i + scroll_der) < (int)contenido_vista_der.size(); i++) {
-            std::string linea = contenido_vista_der[i + scroll_der];
+            string linea = contenido_vista_der[i + scroll_der];
             if ((int)linea.size() > cols_disp) linea = linea.substr(0, cols_disp);
             mvwprintw(win_der, 1 + i, 2, "%s", linea.c_str());
         }
@@ -534,35 +656,35 @@ void dibujar_panel_derecho() {
 //  Muestra usuario, ruta, atajos y hora actual.
 //  El reloj lo manejará un hilo dedicado en la Fase 5.
 // ============================================================
-void dibujar_barra_inferior(const std::string &usuario) {
+void dibujar_barra_inferior(const string &usuario) {
     werase(win_barra);
     wbkgd(win_barra, COLOR_PAIR(COLOR_BARRA));
 
-    // Nombre de usuario y atajos
+    // Fila 0: Usuario y Atajos básicos
     wattron(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
     mvwprintw(win_barra, 0, 1, " %s ", usuario.c_str());
     wattroff(win_barra, A_BOLD);
 
-    mvwprintw(win_barra, 0, 12,"I: Inodos H: Ocultos N: Nano "
-        "F2:Texto  F3:Hex  F4:Props  F5:Arbol  "
-        "C:Copiar  M:Mover  B:Borrar  R:Renombrar  Q:Salir");
-    wattroff(win_barra, COLOR_PAIR(COLOR_BARRA));
+    mvwprintw(win_barra, 0, 12, "F2:Txt F3:Hex F4:Prop F5:Arb | 1:Nom 2:Tam 3:Fec 4:Tip");
+    
+    // Fila 1: Operaciones y Reloj
+    mvwprintw(win_barra, 1, 1, "C:Copy M:Move B:Del P:Chmod A:New K:Dir E:Exec N:Nano H:Hid I:Ino Q:Exit");
 
-    // Fila 1: hora actual (en Fase 5 esto lo actualiza un hilo)
+    // Reloj
     time_t ahora = time(nullptr);
     char buf_hora[32];
-    strftime(buf_hora, sizeof(buf_hora), "%Y-%m-%d  %H:%M:%S", localtime(&ahora));
+    strftime(buf_hora, sizeof(buf_hora), "%H:%M:%S", localtime(&ahora));
 
     wattron(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
     int cols = getmaxx(win_barra);
-    mvwprintw(win_barra, 1, cols - 22, "%s", buf_hora);
+    mvwprintw(win_barra, 1, cols - 10, "%s", buf_hora);
     wattroff(win_barra, COLOR_PAIR(COLOR_BARRA) | A_BOLD);
 
     wrefresh(win_barra);
 }
 
 // ── Abre un archivo en nano como proceso hijo ─────────────────
-void abrir_en_nano(const std::string &ruta_archivo) {
+void abrir_en_nano(const string &ruta_archivo) {
     // Suspender ncurses antes de lanzar nano
     def_prog_mode();   // Guarda el modo actual del terminal
     endwin();          // Libera el terminal para que nano lo use
@@ -593,7 +715,7 @@ void *actualizar_reloj(void *arg) {
     while (hilo_activo) {
         pthread_mutex_lock(&mutex_pantalla);
         if (win_barra) {
-            std::string usuario = obtener_usuario();
+            string usuario = obtener_usuario();
             dibujar_barra_inferior(usuario);
         }
          pthread_mutex_unlock(&mutex_pantalla);
@@ -604,100 +726,68 @@ void *actualizar_reloj(void *arg) {
 // ============================================================
 //  loop_principal() -- Captura teclas
 // ============================================================
-void loop_principal(const std::string &usuario){
-    //Cargar directorio Inicial
-     entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
-     actualizar_contenido_derecho();
+void loop_principal(const string &usuario){
+    // Cargar directorio Inicial
+    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+    actualizar_contenido_derecho();
 
-    //Arrancar el hilo del reloj
-     pthread_create(&hilo_reloj, nullptr, actualizar_reloj, nullptr);
+    // Arrancar hilos
+    pthread_create(&hilo_reloj, nullptr, actualizar_reloj, nullptr);
+    pthread_create(&hilo_refresco, nullptr, hilo_refresco_func, (void*)&usuario);
 
     int ch = 0;
     do {
-        // Redibujar todos los paneles
+        // Notificar al hilo de refresco que debe redibujar
         pthread_mutex_lock(&mutex_pantalla);
-        dibujar_panel_izquierdo();
-        dibujar_panel_derecho();
-        dibujar_barra_inferior(usuario);
+        necesita_refresco = true;
+        pthread_cond_signal(&cond_refresco);
         pthread_mutex_unlock(&mutex_pantalla);
 
-        // Esperar tecla en el panel izquierdo (el activo)
+        // Esperar tecla en el panel izquierdo
         ch = wgetch(win_izq);
 
-        // Detectar redimensionamiento de pantalla
         if (ch == KEY_RESIZE) {
             pthread_mutex_lock(&mutex_pantalla);
             cleanup_terminal();
-            initscr(); // Re-inicializar stdscr
-            getmaxyx(stdscr, TERM_ROWS, TERM_COLS);
+            init_terminal();
             crear_paneles();
-            // Recargar contenido para ajustar scrolls
             entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
             actualizar_contenido_derecho();
+            necesita_refresco = true;
+            pthread_cond_signal(&cond_refresco);
             pthread_mutex_unlock(&mutex_pantalla);
             continue;
         }
 
-       pthread_mutex_lock(&mutex_pantalla);
+        pthread_mutex_lock(&mutex_pantalla);
         switch (ch) {
-
             case KEY_UP:
                 if (indice_sel > 0) {
                     indice_sel--;
-                    if (indice_sel < scroll_offset)
-                        scroll_offset--;
+                    if (indice_sel < scroll_offset) scroll_offset--;
                     scroll_der = 0;
                     actualizar_contenido_derecho();
                 }
                 break;
-
             case KEY_DOWN:
                 if (indice_sel < (int)entradas_actuales.size() - 1) {
                     indice_sel++;
                     int filas_disp = getmaxy(win_izq) - 5;
-                    if (indice_sel >= scroll_offset + filas_disp)
-                        scroll_offset++;
+                    if (indice_sel >= scroll_offset + filas_disp) scroll_offset++;
                     scroll_der = 0;
                     actualizar_contenido_derecho();
                 }
                 break;
-
-            case KEY_PPAGE: // Page Up para el panel derecho
-                if (scroll_der > 0) {
-                    scroll_der -= 5;
-                    if (scroll_der < 0) scroll_der = 0;
-                }
-                break;
-
-            case KEY_NPAGE: // Page Down para el panel derecho
-                if (scroll_der + (getmaxy(win_der) - 2) < (int)contenido_vista_der.size()) {
-                    scroll_der += 5;
-                }
-                break;
-
-            case KEY_F(2):
-                vista_actual = VISTA_TEXTO;
-                scroll_der = 0;
-                actualizar_contenido_derecho();
-                break;
-
-            case KEY_F(3):
-                vista_actual = VISTA_HEX;
-                scroll_der = 0;
-                actualizar_contenido_derecho();
-                break;
-
-            case KEY_F(4):
-                vista_actual = VISTA_PROPS;
-                scroll_der = 0;
-                // No necesita actualizar_contenido_derecho ya que lee stat al dibujar
-                break;
-
-            case KEY_F(5):
-                vista_actual = VISTA_ARBOL;
-                scroll_der = 0;
-                actualizar_contenido_derecho();
-                break;
+            case KEY_F(2): vista_actual = VISTA_TEXTO; scroll_der = 0; actualizar_contenido_derecho(); break;
+            case KEY_F(3): vista_actual = VISTA_HEX; scroll_der = 0; actualizar_contenido_derecho(); break;
+            case KEY_F(4): vista_actual = VISTA_PROPS; scroll_der = 0; break;
+            case KEY_F(5): vista_actual = VISTA_ARBOL; scroll_der = 0; actualizar_contenido_derecho(); break;
+            
+            // ── Ordenamiento ──────────────────────────────────
+            case '1': orden_actual = ORD_NOMBRE; entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos); break;
+            case '2': orden_actual = ORD_TAMANIO; entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos); break;
+            case '3': orden_actual = ORD_FECHA; entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos); break;
+            case '4': orden_actual = ORD_TIPO; entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos); break;
 
             case 10:
             case KEY_ENTER:
@@ -705,71 +795,141 @@ void loop_principal(const std::string &usuario){
                     const Entrada &e = entradas_actuales[indice_sel];
                     if (e.es_dir) {
                         if (e.nombre == "..") {
-                            // Directorio padre
                             auto pos = ruta_actual.rfind('/');
-                            if (pos != std::string::npos && pos != 0)
-                                ruta_actual = ruta_actual.substr(0, pos);
-                            else if (pos == 0)
-                                ruta_actual = "/";
+                            if (pos != string::npos && pos != 0) ruta_actual = ruta_actual.substr(0, pos);
+                            else if (pos == 0) ruta_actual = "/";
                         } else {
                             if (ruta_actual == "/") ruta_actual = "/" + e.nombre;
                             else ruta_actual += "/" + e.nombre;
                         }
                         entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
-                        indice_sel   = 0;
-                        scroll_offset = 0;
-                        scroll_der = 0;
+                        indice_sel = 0; scroll_offset = 0; scroll_der = 0;
                         actualizar_contenido_derecho();
                     }
                 }
                 break;
-            case 'n':
-            case 'N':
-                 if(!entradas_actuales.empty()){
-                  const Entrada &e = entradas_actuales[indice_sel];
-                  if(!e.es_dir){
-                  std::string ruta_completa = ruta_actual + "/" + e.nombre;
-                  if(es_texto(ruta_completa)){
-                   abrir_en_nano(ruta_completa);
-                    //Redibujar todo al regresar del nano
-                    clear();
-                    refresh();
-                    crear_paneles();
+
+            // ── Operaciones de Archivo ────────────────────────
+            case 'c':
+            case 'C': {
+                if (entradas_actuales.empty()) break;
+                string destino = pedir_entrada("Copiar a (ruta/nombre)");
+                if (!destino.empty()) {
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"cp", "-r", unir_ruta(ruta_actual, entradas_actuales[indice_sel].nombre), destino});
+                    reset_prog_mode(); refresh();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                }
+                break;
+            }
+            case 'm':
+            case 'M': {
+                if (entradas_actuales.empty()) break;
+                string destino = pedir_entrada("Mover/Renombrar a");
+                if (!destino.empty()) {
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"mv", unir_ruta(ruta_actual, entradas_actuales[indice_sel].nombre), destino});
+                    reset_prog_mode(); refresh();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                }
+                break;
+            }
+            case 'b':
+            case 'B': {
+                if (entradas_actuales.empty() || entradas_actuales[indice_sel].nombre == "..") break;
+                string conf = pedir_entrada("¿Borrar " + entradas_actuales[indice_sel].nombre + "? (s/n)");
+                if (conf == "s" || conf == "S") {
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"rm", "-rf", unir_ruta(ruta_actual, entradas_actuales[indice_sel].nombre)});
+                    reset_prog_mode(); refresh();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                    if (indice_sel >= (int)entradas_actuales.size()) indice_sel = (int)entradas_actuales.size() - 1;
+                    if (indice_sel < 0) indice_sel = 0;
+                }
+                break;
+            }
+            case 'p':
+            case 'P': {
+                if (entradas_actuales.empty()) break;
+                string modo = pedir_entrada("Nuevo modo (octal, ej: 755)");
+                if (!modo.empty()) {
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"chmod", modo, unir_ruta(ruta_actual, entradas_actuales[indice_sel].nombre)});
+                    reset_prog_mode(); refresh();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                }
+                break;
+            }
+            case 'a':
+            case 'A': {
+                string nuevo = pedir_entrada("Nombre del nuevo archivo");
+                if (!nuevo.empty()) {
+                    string r = unir_ruta(ruta_actual, nuevo);
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"touch", r});
+                    reset_prog_mode(); refresh();
+                    // Usar --wait para que el gestor espere a que cierres la ventana
+                    ejecutar_comando({"gnome-terminal", "--wait", "--", "nano", r});
                     entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
                     actualizar_contenido_derecho();
-                     }else{
-                       //Mostrar mensaje si no es texto
-                       mvwprintw(win_barra, 2, 2, "No es un archivo de texto ASCII");
-                       wrefresh(win_barra);
-                       napms(1500);  // Mostrar 1.5 segundos
-                      }
-                   }
-                 }
+                }
+                break;
+            }
+            case 'k':
+            case 'K': {
+                string nuevo = pedir_entrada("Nombre del nuevo directorio");
+                if (!nuevo.empty()) {
+                    def_prog_mode(); endwin();
+                    ejecutar_comando({"mkdir", "-p", unir_ruta(ruta_actual, nuevo)});
+                    reset_prog_mode(); refresh();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                }
+                break;
+            }
+            case 'e':
+            case 'E': {
+                if (entradas_actuales.empty()) break;
+                const Entrada &e = entradas_actuales[indice_sel];
+                string cmd = unir_ruta(ruta_actual, e.nombre);
+                // Lanzar en una nueva ventana de terminal (Requisito de "otra ventana")
+                // Se usa sh -c para que la ventana no se cierre inmediatamente al terminar
+                ejecutar_comando({"gnome-terminal", "--", "sh", "-c", cmd + "; echo; echo 'Proceso terminado. Presione una tecla para cerrar...'; read -n 1"});
+                break;
+            }
+            case 'n':
+            case 'N':
+                if(!entradas_actuales.empty()){
+                    const Entrada &e = entradas_actuales[indice_sel];
+                    if(!e.es_dir){
+                        string r = unir_ruta(ruta_actual, e.nombre);
+                        if(es_texto(r)) {
+                            // Abrir nano en una nueva ventana y esperar a que cierre
+                            ejecutar_comando({"gnome-terminal", "--wait", "--", "nano", r});
+                            entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                            actualizar_contenido_derecho();
+                        }
+                    }
+                }
                 break;
             case 'h':
             case 'H':
                 mostrar_ocultos = !mostrar_ocultos;
                 entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
-                indice_sel   = 0;
-                scroll_offset = 0;
-                scroll_der = 0;
+                indice_sel = 0; scroll_offset = 0; scroll_der = 0;
                 actualizar_contenido_derecho();
                 break;
-
             case 'i':
-            case 'I':
-                mostrar_inodos = !mostrar_inodos;
-                break;
-            case 'q':
-            case 'Q':
-                // Salir
-                break;
-
+            case 'I': mostrar_inodos = !mostrar_inodos; break;
         }
-      pthread_mutex_unlock(&mutex_pantalla);
+        necesita_refresco = true;
+        pthread_cond_signal(&cond_refresco);
+        pthread_mutex_unlock(&mutex_pantalla);
     } while (ch != 'q' && ch != 'Q');
+
     hilo_activo = false;
+    pthread_cond_signal(&cond_refresco);
     pthread_join(hilo_reloj, nullptr);
+    pthread_join(hilo_refresco, nullptr);
 }
 
 // ============================================================
@@ -777,7 +937,7 @@ void loop_principal(const std::string &usuario){
 // ============================================================
 int main(int argc, char *argv[]) {
     // Directorio inicial: argumento o directorio actual
-    std::string ruta_inicial = (argc > 1) ? argv[1] : ".";
+    string ruta_inicial = (argc > 1) ? argv[1] : ".";
 
     // Limpiar el terminal al salir aunque haya crash
     atexit(cleanup_terminal);
@@ -789,7 +949,7 @@ int main(int argc, char *argv[]) {
     crear_paneles();
 
     // 4. Obtener usuario actual (POSIX)
-    std::string usuario = obtener_usuario();
+    string usuario = obtener_usuario();
 
     // 5. Entrar al loop principal
       ruta_actual=ruta_inicial;
