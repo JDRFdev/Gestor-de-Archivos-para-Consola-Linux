@@ -16,7 +16,3 @@ Linea de prueba 13
 Linea de prueba 14
 Linea de prueba 15
 Linea de prueba 16
-Linea de prueba 17
-Linea de prueba 18
-Linea de prueba 19
-Linea de prueba 20

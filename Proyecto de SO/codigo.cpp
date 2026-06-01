@@ -723,6 +723,29 @@ void loop_principal(const std::string &usuario){
                     }
                 }
                 break;
+            case 'n':
+            case 'N':
+                 if(!entradas_actuales.empty()){
+                  const Entrada &e = entradas_actuales[indice_sel];
+                  if(!e.es_dir){
+                  std::string ruta_completa = ruta_actual + "/" + e.nombre;
+                  if(es_texto(ruta_completa)){
+                   abrir_en_nano(ruta_completa);
+                    //Redibujar todo al regresar del nano
+                    clear();
+                    refresh();
+                    crear_paneles();
+                    entradas_actuales = leer_directorio(ruta_actual, mostrar_ocultos);
+                    actualizar_contenido_derecho();
+                     }else{
+                       //Mostrar mensaje si no es texto
+                       mvwprintw(win_barra, 2, 2, "No es un archivo de texto ASCII");
+                       wrefresh(win_barra);
+                       napms(1500);  // Mostrar 1.5 segundos
+                      }
+                   }
+                 }
+                break;
             case 'h':
             case 'H':
                 mostrar_ocultos = !mostrar_ocultos;
